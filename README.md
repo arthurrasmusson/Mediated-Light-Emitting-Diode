@@ -1,4 +1,4 @@
-# MLEDdev – Mediated Light Emitting Diode Device
+# MLED – Mediated Light Emitting Diode
 
 ## Control an LED from an arbitrary number of QEMU/KVM guests (Raspberry Pi 3/4/4)
 
@@ -77,7 +77,7 @@ older Pi 2 (Cortex‑A7).
 
 ```bash
 git clone https://github.com/arthurrasmusson/Mediated-Light-Emitting-Diode.git
-cd vfio-mdev-gpio-led/kernel
+cd Mediated-Light-Emitting-Diode/kernel
 make                             # builds mled-vfio.ko
 sudo insmod mled-vfio.ko
 ```

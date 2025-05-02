@@ -1,96 +1,161 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * mled-vfio.ko
+ * mled-vfio.ko ─ a **minimal** mediated-device that exposes one writable byte
+ * to a guest VM; the byte toggles a real GPIO LED on the host.
  *
- * VFIO-mdev sample that exposes ONE writable byte to a guest.
- *   0 → LED off
- *   1 → LED on
- *
- * On the host a real Raspberry-Pi GPIO is toggled via libgpiod.
- * This is the minimal skeleton you need to glue Neo-Jia style
- * mdev plumbing onto any arbitrary low-level backend.
+ *   guest writes 0 → LED off
+ *   guest writes 1 → LED on
  *
  * 2025-05-02  Arthur Rasmusson
+ *
+ * ---------------------------------------------------------------------------
+ * Kernel-API compatibility
+ * ---------------------------------------------------------------------------
+ * For Linux < 6.5:
+ *   vfio_alloc_device(TYPE, device, group, ops)
+ *
+ * For Linux >= 6.5 (and later, including 6.8):
+ *   vfio_alloc_device(dev_struct, member, dev, ops)
+ * where 'member' is the name of the embedded struct vfio_device field.
  */
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/version.h>
 #include <linux/mdev.h>
 #include <linux/vfio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/mutex.h>
 
-#define DRV_NAME          "mled-vfio"
-#define CLASS_NAME        "vfio-gpio-led"
+#define DRV_NAME   "mled-vfio"
+#define CLASS_NAME "vfio-gpio-led"
 
-/* We fake a “PCI function” with exactly one region (BAR0). */
-#define REGION_IDX_DATA   VFIO_PCI_BAR0_REGION_INDEX
-#define REGION_SIZE       1         /* single byte exposed to the guest */
+/* We emulate a PCI BAR0 that is exactly one byte long */
+#define REGION_IDX_DATA VFIO_PCI_BAR0_REGION_INDEX
+#define REGION_SIZE     1
 
 /* -------------------------------------------------------------------------- */
-/* Per-mediated-device state */
+/*               Version-dependent glue                                       */
+/* -------------------------------------------------------------------------- */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+/* ---------------------------- < 6.5 --------------------------------------- */
+#define HAVE_IOMMUFD_OPS 0
+#define mdev_to_dev(m) (&(m)->dev)
+/*
+ * Old macro signature:
+ *   vfio_alloc_device(TYPE, device, group, ops)
+ *
+ * We pass NULL for group because mdev sets it up automatically.
+ */
+#define VFIO_ALLOC(state_ptr, mdev)                                            \
+	do {                                                                   \
+		state_ptr = vfio_alloc_device(struct led_mdev_state,           \
+					      mdev_to_dev(mdev),               \
+					      NULL,                            \
+					      &led_ops);                       \
+	} while (0)
+
+#else
+/* ---------------------------- >= 6.5 -------------------------------------- */
+#define HAVE_IOMMUFD_OPS 1
+#include <linux/iommufd.h>  /* pulls in the iommufd-based helpers */
+#define mdev_to_dev(m) mdev_dev(m)
+/*
+ * New macro signature (4 args):
+ *   vfio_alloc_device(dev_struct, member, dev, ops)
+ *
+ *  - dev_struct = the name of your struct (NO "struct" keyword),
+ *  - member     = the name of the embedded struct vfio_device field,
+ *  - dev        = parent device,
+ *  - ops        = pointer to vfio_device_ops
+ */
+#define VFIO_ALLOC(state_ptr, mdev)                                            \
+	do {                                                                   \
+		state_ptr = vfio_alloc_device(led_mdev_state, vdev,           \
+					      mdev_to_dev(mdev),               \
+					      &led_ops);                       \
+	} while (0)
+
+#endif
+
+/* -------------------------------------------------------------------------- */
+/*               Per-device state                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * struct led_mdev_state - our private device context
+ * @vdev:   embedded VFIO device (must be first for container_of())
+ * @mdev:   parent mediated device pointer
+ * @led_gpio: handle to an actual GPIO line
+ * @value:  the last byte written by the guest (0 or 1)
+ * @lock:   protects @value and the LED GPIO
+ */
 struct led_mdev_state {
-	struct vfio_device  vdev;       /* first → container_of trick        */
-	struct mdev_device *mdev;       /* pointer back to mediated device   */
+	/* Must be first, so container_of(&vdev, led_mdev_state, vdev) works */
+	struct vfio_device  vdev;
+	struct mdev_device *mdev;
 
-	struct gpio_desc   *led_gpio;   /* handle returned by gpiod_get()    */
-	u8                  value;      /* last byte written by the guest    */
+	struct gpio_desc   *led_gpio;
+	u8                  value;
 
-	struct mutex        lock;       /* protects value + GPIO             */
+	struct mutex        lock; /* protects value + GPIO */
 };
 
-static struct led_mdev_state *vdev_to_state(struct vfio_device *v)
+static inline struct led_mdev_state *
+vdev_to_state(struct vfio_device *v)
 {
 	return container_of(v, struct led_mdev_state, vdev);
 }
 
 /* -------------------------------------------------------------------------- */
-/* Helper: push cached ‘value’ out to real GPIO */
+/*               Hardware helper                                              */
+/* -------------------------------------------------------------------------- */
 
 static void led_hw_update(struct led_mdev_state *s)
 {
-	/* Must hold s->lock */
+	/* Caller holds s->lock */
 	if (s->led_gpio)
 		gpiod_set_value_cansleep(s->led_gpio, !!s->value);
 }
 
 /* -------------------------------------------------------------------------- */
-/* VFIO data-plane callbacks */
+/*               VFIO data-plane callbacks                                    */
+/* -------------------------------------------------------------------------- */
 
-static ssize_t led_read(struct vfio_device *vdev,
-		        char __user *buf, size_t count, loff_t *ppos)
+static ssize_t led_read(struct vfio_device *v,
+			char __user *buf, size_t count, loff_t *ppos)
 {
-	/* region is only 1 byte long → EOF after first read            */
 	if (*ppos >= REGION_SIZE || !count)
 		return 0;
 
-	if (copy_to_user(buf, &vdev_to_state(vdev)->value, 1))
+	if (copy_to_user(buf, &vdev_to_state(v)->value, 1))
 		return -EFAULT;
+
 	*ppos = 1;
 	return 1;
 }
 
-static ssize_t led_write(struct vfio_device *vdev,
-		         const char __user *buf, size_t count, loff_t *ppos)
+static ssize_t led_write(struct vfio_device *v,
+			 const char __user *buf, size_t count, loff_t *ppos)
 {
-	struct led_mdev_state *s = vdev_to_state(vdev);
+	struct led_mdev_state *s = vdev_to_state(v);
 	u8 val;
 
-	/* Only allow a single-byte write at offset 0                   */
 	if (*ppos || !count)
 		return -EINVAL;
+
 	if (copy_from_user(&val, buf, 1))
 		return -EFAULT;
 
 	mutex_lock(&s->lock);
-	s->value = val ? 1 : 0; /* coerce to 0/1                        */
-	led_hw_update(s);       /* actually toggle the pin              */
+	s->value = val ? 1 : 0;
+	led_hw_update(s);
 	mutex_unlock(&s->lock);
 
 	*ppos = 1;
 	return 1;
 }
 
-/* Return region layout for GET_REGION_INFO */
 static int led_region_info(struct vfio_region_info *ri)
 {
 	if (ri->index != REGION_IDX_DATA)
@@ -99,34 +164,37 @@ static int led_region_info(struct vfio_region_info *ri)
 	ri->offset = 0;
 	ri->size   = REGION_SIZE;
 	ri->flags  = VFIO_REGION_INFO_FLAG_READ |
-	             VFIO_REGION_INFO_FLAG_WRITE;
+		     VFIO_REGION_INFO_FLAG_WRITE;
 	return 0;
 }
 
-/* All other VFIO ioctls funnel through here.  We only implement the
- * bare minimum: device info + region info. */
 static long led_ioctl(struct vfio_device *v,
-                      unsigned int cmd, unsigned long arg)
+		      unsigned int cmd, unsigned long arg)
 {
 	unsigned long min;
+
 	switch (cmd) {
 	case VFIO_DEVICE_GET_INFO: {
 		struct vfio_device_info info;
+
 		min = offsetofend(struct vfio_device_info, num_irqs);
 		if (copy_from_user(&info, (void __user *)arg, min))
 			return -EFAULT;
 		if (info.argsz < min)
 			return -EINVAL;
 
-		info.flags       = VFIO_DEVICE_FLAGS_PCI;  /* fake PCI */
+		/* Fake a "PCI" device so QEMU sees a PCI region. */
+		info.flags       = VFIO_DEVICE_FLAGS_PCI;
 		info.num_regions = REGION_IDX_DATA + 1;
 		info.num_irqs    = 0;
 
 		return copy_to_user((void __user *)arg, &info, min)
-		       ? -EFAULT : 0;
+			? -EFAULT : 0;
 	}
+
 	case VFIO_DEVICE_GET_REGION_INFO: {
 		struct vfio_region_info ri;
+
 		min = offsetofend(struct vfio_region_info, offset);
 		if (copy_from_user(&ri, (void __user *)arg, min))
 			return -EFAULT;
@@ -137,24 +205,24 @@ static long led_ioctl(struct vfio_device *v,
 			return -EINVAL;
 
 		return copy_to_user((void __user *)arg, &ri, min)
-		       ? -EFAULT : 0;
+			? -EFAULT : 0;
 	}
+
 	default:
 		return -ENOTTY;
 	}
 }
 
 /* -------------------------------------------------------------------------- */
-/* Lifecycle hooks */
+/*               VFIO lifecycle callbacks                                    */
+/* -------------------------------------------------------------------------- */
 
 static int led_init(struct vfio_device *v)
 {
 	struct led_mdev_state *s = vdev_to_state(v);
 
-	/* GPIO is looked up by a DT alias/ACPI handle named “status”.
-	 * Change the second arg to force a different pin. */
-	s->led_gpio = gpiod_get(&mdev_dev(s->mdev)->dev,
-	                        "status", GPIOD_OUT_LOW);
+	/* Acquire a GPIO named "status" (or whatever name your DT/ACPI uses). */
+	s->led_gpio = gpiod_get(mdev_to_dev(s->mdev), "status", GPIOD_OUT_LOW);
 	if (IS_ERR(s->led_gpio))
 		return PTR_ERR(s->led_gpio);
 
@@ -166,30 +234,29 @@ static void led_release(struct vfio_device *v)
 {
 	struct led_mdev_state *s = vdev_to_state(v);
 
-	if (s->led_gpio)
+	if (!IS_ERR_OR_NULL(s->led_gpio))
 		gpiod_put(s->led_gpio);
 }
 
-/* -------------------------------------------------------------------------- */
-/* VFIO dispatch table (minimal) */
-
 static const struct vfio_device_ops led_ops = {
-	.name           = "vfio-gpio-led",
-	.init           = led_init,
-	.release        = led_release,
-	.read           = led_read,
-	.write          = led_write,
-	.ioctl          = led_ioctl,
+	.name    = "vfio-gpio-led",
+	.init    = led_init,
+	.release = led_release,
+	.read    = led_read,
+	.write   = led_write,
+	.ioctl   = led_ioctl,
 
-	/* All IOMMU-FD helpers route to the simple “emulated” variant */
-	.bind_iommufd	= vfio_iommufd_emulated_bind,
-	.unbind_iommufd	= vfio_iommufd_emulated_unbind,
-	.attach_ioas	= vfio_iommufd_emulated_attach_ioas,
-	.detach_ioas	= vfio_iommufd_emulated_detach_ioas,
+#if HAVE_IOMMUFD_OPS
+	.bind_iommufd   = vfio_iommufd_emulated_bind,
+	.unbind_iommufd = vfio_iommufd_emulated_unbind,
+	.attach_ioas    = vfio_iommufd_emulated_attach_ioas,
+	.detach_ioas    = vfio_iommufd_emulated_detach_ioas,
+#endif
 };
 
 /* -------------------------------------------------------------------------- */
-/* mdev glue: one type (“led-1”), unlimited instances */
+/*               mdev glue (one type, many instances)                         */
+/* -------------------------------------------------------------------------- */
 
 static struct mdev_parent parent;
 static struct mdev_type led_type = {
@@ -197,23 +264,28 @@ static struct mdev_type led_type = {
 	.pretty_name = "gpio-led",
 };
 
-/* Called whenever `echo <uuid> > …/led-1/create` happens */
+/**
+ * led_probe() - called when userspace creates a new mediated device
+ */
 static int led_probe(struct mdev_device *mdev)
 {
 	struct led_mdev_state *s;
 
-	/* allocate & register vfio_device wrapper */
-	s = vfio_alloc_device(s, vdev, &mdev->dev, &led_ops);
+	/* The VFIO_ALLOC() macro picks the right vfio_alloc_device() usage */
+	VFIO_ALLOC(s, mdev);
 	if (IS_ERR(s))
 		return PTR_ERR(s);
 
 	s->mdev = mdev;
 	dev_set_drvdata(&mdev->dev, s);
 
+	/* For iommufd-based drivers, we call vfio_register_emulated_iommu_dev() */
 	return vfio_register_emulated_iommu_dev(&s->vdev);
 }
 
-/* Cleanup when that mediated device is destroyed */
+/**
+ * led_remove() - called when userspace destroys the mediated device
+ */
 static void led_remove(struct mdev_device *mdev)
 {
 	struct led_mdev_state *s = dev_get_drvdata(&mdev->dev);
@@ -222,11 +294,13 @@ static void led_remove(struct mdev_device *mdev)
 	vfio_put_device(&s->vdev);
 }
 
-/* Advertise how many instances we can still create (arbitrary 16) */
-static unsigned int led_avail(struct mdev_type *t) { return 16; }
+static unsigned int led_avail(struct mdev_type *t)
+{
+	return 16; /* Allow up to 16 concurrent mdev instances */
+}
 
 static struct mdev_driver led_driver = {
-	.device_api  = VFIO_DEVICE_API_PCI_STRING,
+	.device_api = VFIO_DEVICE_API_PCI_STRING,
 	.driver = {
 		.name  = DRV_NAME,
 		.owner = THIS_MODULE,
@@ -237,22 +311,22 @@ static struct mdev_driver led_driver = {
 };
 
 /* -------------------------------------------------------------------------- */
-/* Module entry points */
+/*               Module boilerplate                                          */
+/* -------------------------------------------------------------------------- */
 
 static int __init led_init_mod(void)
 {
 	int ret;
 
-	/* Register with mdev core first */
 	ret = mdev_register_driver(&led_driver);
 	if (ret)
 		return ret;
 
-	/* Create the parent device so sysfs exposes led-1/create */
 	ret = mdev_register_parent(&parent, NULL, &led_driver,
-	                           (struct mdev_type *[]){ &led_type }, 1);
+				   (struct mdev_type *[]) { &led_type }, 1);
 	if (ret)
 		mdev_unregister_driver(&led_driver);
+
 	return ret;
 }
 
@@ -266,6 +340,6 @@ module_init(led_init_mod);
 module_exit(led_exit_mod);
 
 MODULE_AUTHOR("Arthur Rasmusson");
-MODULE_DESCRIPTION("VFIO mdev GPIO LED");
+MODULE_DESCRIPTION("Sample VFIO-mdev GPIO LED");
 MODULE_LICENSE("GPL");
 
