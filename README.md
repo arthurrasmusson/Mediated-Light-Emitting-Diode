@@ -1,6 +1,6 @@
 # MLED – Mediated Light Emitting Diode
 
-## Control an LED from an arbitrary number of QEMU/KVM guests (Raspberry Pi 3/4/4)
+## Control an LED using GPIO from an arbitrary number of QEMU/KVM guests (Raspberry Pi 3/4/5)
 
 This repo contains the **full vertical stack** for a *mediated* GPIO
 device:
