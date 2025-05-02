@@ -33,6 +33,9 @@
 #define REGION_IDX_DATA VFIO_PCI_BAR0_REGION_INDEX
 #define REGION_SIZE     1
 
+// Additional note: This minimal "BAR0" region is used by the guest to read/write
+// a single byte that controls the LED on the host.
+
 /* -------------------------------------------------------------------------- */
 /*               Version-dependent glue                                       */
 /* -------------------------------------------------------------------------- */
@@ -90,6 +93,8 @@
  * @value:  the last byte written by the guest (0 or 1)
  * @lock:   protects @value and the LED GPIO
  */
+// Additional note: The 'vdev' is the actual VFIO device object. The rest of
+// the fields handle our LED-specific state tracking and concurrency.
 struct led_mdev_state {
 	/* Must be first, so container_of(&vdev, led_mdev_state, vdev) works */
 	struct vfio_device  vdev;
@@ -101,6 +106,8 @@ struct led_mdev_state {
 	struct mutex        lock; /* protects value + GPIO */
 };
 
+// Additional note: This helper simply casts from the embedded vfio_device to
+// our 'led_mdev_state' struct. We rely on the 'vdev' field being at offset zero.
 static inline struct led_mdev_state *
 vdev_to_state(struct vfio_device *v)
 {
@@ -111,6 +118,9 @@ vdev_to_state(struct vfio_device *v)
 /*               Hardware helper                                              */
 /* -------------------------------------------------------------------------- */
 
+// Additional note: This function updates the host GPIO line to reflect the
+// cached LED value that the guest last wrote. A typical use case is turning
+// a physical LED on or off based on 's->value'.
 static void led_hw_update(struct led_mdev_state *s)
 {
 	/* Caller holds s->lock */
@@ -122,9 +132,17 @@ static void led_hw_update(struct led_mdev_state *s)
 /*               VFIO data-plane callbacks                                    */
 /* -------------------------------------------------------------------------- */
 
+// Additional note: The read/write/ioctl callbacks are invoked when QEMU
+// or other VFIO userspace does read/write/ioctl on the device FD. They
+// implement minimal PCI-like behavior: a 1-byte region.
+
 static ssize_t led_read(struct vfio_device *v,
 			char __user *buf, size_t count, loff_t *ppos)
 {
+	// Additional note: We only provide 1 byte at offset 0. Once that is
+	// read, subsequent reads return 0 bytes. This simulates a small
+	// read-only device region.
+
 	if (*ppos >= REGION_SIZE || !count)
 		return 0;
 
@@ -140,6 +158,9 @@ static ssize_t led_write(struct vfio_device *v,
 {
 	struct led_mdev_state *s = vdev_to_state(v);
 	u8 val;
+
+	// Additional note: Writes must occur at offset 0, and we only accept
+	// 1 byte. We then store it in 'value' and apply it to the LED.
 
 	if (*ppos || !count)
 		return -EINVAL;
@@ -158,6 +179,9 @@ static ssize_t led_write(struct vfio_device *v,
 
 static int led_region_info(struct vfio_region_info *ri)
 {
+	// Additional note: Userspace (QEMU, etc.) calls GET_REGION_INFO to
+	// discover how large each region is and what flags it has.
+
 	if (ri->index != REGION_IDX_DATA)
 		return -EINVAL;
 
@@ -172,6 +196,10 @@ static long led_ioctl(struct vfio_device *v,
 		      unsigned int cmd, unsigned long arg)
 {
 	unsigned long min;
+
+	// Additional note: The only VFIO ioctls we handle are GET_INFO and
+	// GET_REGION_INFO. Others return ENOTTY. This is enough for a simple
+	// device that exposes only a single memory region without interrupts.
 
 	switch (cmd) {
 	case VFIO_DEVICE_GET_INFO: {
@@ -217,6 +245,11 @@ static long led_ioctl(struct vfio_device *v,
 /*               VFIO lifecycle callbacks                                    */
 /* -------------------------------------------------------------------------- */
 
+// Additional note: The .init and .release callbacks below correspond to the
+// device lifecycle for a VFIO/mdev device. The LED is requested in ->init
+// and freed in ->release. Typically, these get triggered when VFIO sets up
+// or tears down the device for use by a guest.
+
 static int led_init(struct vfio_device *v)
 {
 	struct led_mdev_state *s = vdev_to_state(v);
@@ -238,6 +271,13 @@ static void led_release(struct vfio_device *v)
 		gpiod_put(s->led_gpio);
 }
 
+/* -------------------------------------------------------------------------- */
+/*               VFIO operations table                                        */
+/* -------------------------------------------------------------------------- */
+
+// Additional note: This table defines our VFIO device's operations, which
+// includes init/release, read/write, and optionally iommufd-based attach/detach.
+
 static const struct vfio_device_ops led_ops = {
 	.name    = "vfio-gpio-led",
 	.init    = led_init,
@@ -257,6 +297,9 @@ static const struct vfio_device_ops led_ops = {
 /* -------------------------------------------------------------------------- */
 /*               mdev glue (one type, many instances)                         */
 /* -------------------------------------------------------------------------- */
+
+// Additional note: This code registers a "parent" that can create multiple
+// mediated devices of type "led-1", each hooking into the same driver.
 
 static struct mdev_parent parent;
 static struct mdev_type led_type = {
@@ -294,6 +337,14 @@ static void led_remove(struct mdev_device *mdev)
 	vfio_put_device(&s->vdev);
 }
 
+/**
+ * led_avail() - returns how many more mdev instances can be created
+ * @t: the mdev_type
+ *
+ * Return: a static limit of 16
+ */
+// Additional note: This function is polled by the mdev core to see if we can
+// still create additional devices of this type. Here we set an arbitrary max.
 static unsigned int led_avail(struct mdev_type *t)
 {
 	return 16; /* Allow up to 16 concurrent mdev instances */
@@ -314,6 +365,17 @@ static struct mdev_driver led_driver = {
 /*               Module boilerplate                                          */
 /* -------------------------------------------------------------------------- */
 
+// Additional note: In typical kernel modules, we register the driver in
+// module_init() and unregister in module_exit().
+
+/**
+ * led_init_mod() - module init function
+ * Registers the mdev_driver and its single mdev_type
+ *
+ * Return: 0 on success or a negative error code.
+ */
+// More explanation: We first register the mdev_driver, then the parent that
+// supports the "led_type". If anything fails, we unwind carefully.
 static int __init led_init_mod(void)
 {
 	int ret;
@@ -330,6 +392,12 @@ static int __init led_init_mod(void)
 	return ret;
 }
 
+/**
+ * led_exit_mod() - module exit function
+ * Unregisters everything we registered in led_init_mod().
+ */
+// More explanation: This removes the parent and the driver from the system,
+// ensuring no leftover resources remain after the module is removed.
 static void __exit led_exit_mod(void)
 {
 	mdev_unregister_parent(&parent);
